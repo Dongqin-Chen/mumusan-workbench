@@ -1,0 +1,19 @@
+{
+  "name": "木木三工作台",
+  "short_name": "工作台",
+  "description": "木木三的个人工作台，统一查看今日调度、学习进度、工作线状态和私密区域。",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#171716",
+  "theme_color": "#0f0f0e",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "mumusan-workbench",
+  "version": "1.0.0",
+  "description": "木木三工作台 - Cloudflare Pages + D1 版",
+  "scripts": {
+    "dev": "wrangler pages dev",
+    "deploy": "wrangler pages deploy",
+    "db:create": "wrangler d1 create mumusan-workbench-db",
+    "db:migrate": "wrangler d1 migrations apply mumusan-workbench-db",
+    "db:local": "wrangler d1 execute mumusan-workbench-db --local --file=./migrations/0001_init.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.158.0"
+  },
+  "dependencies": {}
+}
