@@ -1,30 +1,25 @@
 /**
- * 双端同步 · Cloudflare Pages Functions · GitHub 版
+ * 双端同步 · Cloudflare Pages Functions · D1 版
  * 路由：/functions/api/sync.js → https://你的域名/api/sync
  *
  * ── 架构 ──
  *   - 前端单页应用托管在 Pages 静态资源
  *   - 此函数运行在 Cloudflare Workers 边缘
- *   - 数据持久化到 GitHub 仓库文件（sync-data/<uid>.json）
+ *   - 数据持久化到 Cloudflare D1（SQLite 边缘数据库）
  *
- * ── 与 D1 版对比 ──
- *   - 存储：GitHub 文件 vs D1 数据库
- *   - API：完全一致，前端零改动
- *   - 一致性：GitHub 强一致
- *   - 优点：免费、自带版本历史、无需数据库配置
+ * ── 与 EdgeOne Blob 版对比 ──
+ *   - 数据模型：D1 表结构 vs Blob 对象存储
+ *   - API 接口：完全一致，前端零改动
+ *   - 一致性：D1 强一致，无需额外配置
+ *   - 可移植性：D1 SQL 标准，易于迁移
  *
  * ── 安全设计 ──
  *   - 密码加盐 SHA-256 哈希
- *   - 敏感数据（盐、哈希）与用户数据分开存储
+ *   - 限流：连续失败 5 次锁定 5 分钟
  *   - CORS 预检支持
  */
 
 const MAX_BYTES = 700 * 1024;  // 受限于请求体 1MB
-
-// GitHub 配置（通过环境变量注入）
-const GITHUB_TOKEN = env => env.GITHUB_TOKEN;
-const GITHUB_REPO = env => env.GITHUB_REPO || 'Dongqin-Chen/mumusan-workbench';
-const GITHUB_BRANCH = env => env.GITHUB_BRANCH || 'main';
 
 /** 统一 JSON 响应 */
 function json(obj, status = 200) {
@@ -78,70 +73,74 @@ async function getUid(user) {
   return await hex('u|' + user);
 }
 
-/** 从 GitHub 读取文件内容 */
-async function githubReadFile(env, path) {
-  const token = GITHUB_TOKEN(env);
-  if (!token) throw new Error('GITHUB_TOKEN 未配置');
-  
-  const url = `https://api.github.com/repos/${GITHUB_REPO(env)}/contents/${encodeURIComponent(path)}?ref=${GITHUB_BRANCH(env)}`;
-  const resp = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/vnd.github.v3+json',
-      'User-Agent': 'mumusan-workbench'
-    }
-  });
-  
-  if (resp.status === 404) return null;
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`GitHub 读取失败: ${resp.status} ${text}`);
+/** 初始化数据库表（如果不存在） */
+async function initDatabase(db) {
+  try {
+    // 用户认证表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        salt TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        changed_at INTEGER
+      )
+    `);
+    
+    // 用户数据表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS user_data (
+        user_id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    `);
+    
+    // 同步日志
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        size INTEGER,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    `);
+    
+    // 限流表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS rate_limit (
+        user_id TEXT PRIMARY KEY,
+        n INTEGER DEFAULT 0,
+        until INTEGER DEFAULT 0,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    `);
+    
+    // 索引
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_sync_log_user ON sync_log(user_id, created_at)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at)`);
+    
+    return true;
+  } catch (e) {
+    console.error('Init DB error:', e);
+    return false;
   }
-  
-  const data = await resp.json();
-  if (!data.content) return null;
-  
-  // GitHub API 返回 base64 编码的内容
-  const content = atob(data.content.replace(/\n/g, ''));
-  return JSON.parse(content);
-}
-
-/** 写入文件到 GitHub */
-async function githubWriteFile(env, path, content, message, sha) {
-  const token = GITHUB_TOKEN(env);
-  if (!token) throw new Error('GITHUB_TOKEN 未配置');
-  
-  const body = {
-    message,
-    content: btoa(JSON.stringify(content, null, 2)),
-    branch: GITHUB_BRANCH(env)
-  };
-  
-  if (sha) body.sha = sha;
-  
-  const url = `https://api.github.com/repos/${GITHUB_REPO(env)}/contents/${encodeURIComponent(path)}`;
-  const resp = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/vnd.github.v3+json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'mumusan-workbench'
-    },
-    body: JSON.stringify(body)
-  });
-  
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`GitHub 写入失败: ${resp.status} ${text}`);
-  }
-  
-  return await resp.json();
 }
 
 /** 主处理函数 */
 export async function onRequestPost(context) {
   const { request, env } = context;
+  const db = env.DB;
+  
+  // 初始化数据库（首次访问时）
+  if (db) {
+    await initDatabase(db);
+  } else {
+    return json({ error: 'D1 数据库未绑定，请在 Cloudflare Pages 设置中绑定 D1 数据库' }, 500);
+  }
   
   let body;
   try {
@@ -164,35 +163,38 @@ export async function onRequestPost(context) {
   
   const uid = await getUid(user);
   const now = Date.now();
-  const authPath = `sync-data/auth/${uid}.json`;
-  const dataPath = `sync-data/data/${uid}.json`;
   
   try {
     // ── 首次使用：注册 ──
     if (action === 'register' || action === 'push') {
-      const existingAuth = await githubReadFile(env, authPath);
+      // 检查用户是否存在
+      const auth = await db.prepare(
+        'SELECT id FROM users WHERE id = ?'
+      ).bind(uid).first();
       
-      if (!existingAuth) {
+      if (!auth) {
         // 新用户注册
         const salt = randSalt();
         const hash = await hex(pass + '|' + salt);
         const data = body.data || {};
         
-        const authResult = await githubWriteFile(env, authPath, {
-          salt,
-          hash,
-          created_at: now,
-          changed_at: null
-        }, `Register user ${user}`);
+        await db.prepare(
+          'INSERT INTO users (id, salt, hash, created_at) VALUES (?, ?, ?, ?)'
+        ).bind(uid, salt, hash, now).run();
         
-        await githubWriteFile(env, dataPath, data, `Init data for ${user}`);
+        await db.prepare(
+          'INSERT INTO user_data (user_id, data, updated_at) VALUES (?, ?, ?)'
+        ).bind(uid, JSON.stringify(data), now).run();
         
         return json({ ok: true, created: true, data });
       }
     }
     
     // ── 读取认证信息 ──
-    const auth = await githubReadFile(env, authPath);
+    const auth = await db.prepare(
+      'SELECT salt, hash, created_at FROM users WHERE id = ?'
+    ).bind(uid).first();
+    
     if (!auth) {
       return json({ error: 'NO_ACCOUNT' }, 404);
     }
@@ -213,23 +215,20 @@ export async function onRequestPost(context) {
       const salt = randSalt();
       const hash = await hex(np + '|' + salt);
       
-      // 读取现有文件 SHA（GitHub API 返回的 sha 字段）
-      const existingAuth = await githubReadFile(env, authPath);
-      const authSha = existingAuth ? await githubReadFile(env, authPath).then(f => f && f.sha) : undefined;
-      
-      await githubWriteFile(env, authPath, {
-        salt,
-        hash,
-        created_at: auth.created_at,
-        changed_at: now
-      }, `Change password for ${user}`, authSha);
+      await db.prepare(
+        'UPDATE users SET salt = ?, hash = ?, changed_at = ? WHERE id = ?'
+      ).bind(salt, hash, now, uid).run();
       
       return json({ ok: true, changed: true });
     }
     
     // ── 拉取 ──
     if (action === 'pull') {
-      const data = await githubReadFile(env, dataPath) || {};
+      const row = await db.prepare(
+        'SELECT data FROM user_data WHERE user_id = ?'
+      ).bind(uid).first();
+      
+      const data = row ? JSON.parse(row.data) : {};
       return json({ ok: true, data });
     }
     
@@ -241,15 +240,27 @@ export async function onRequestPost(context) {
       }
       
       // 获取服务端数据
-      const server = await githubReadFile(env, dataPath) || {};
+      const serverRow = await db.prepare(
+        'SELECT data FROM user_data WHERE user_id = ?'
+      ).bind(uid).first();
+      
+      const server = serverRow ? JSON.parse(serverRow.data) : {};
       const client = body.data || {};
       const merged = mergeAll(server, client);
       
-      // 读取现有文件 SHA
-      const existingData = await githubReadFile(env, dataPath);
-      const dataSha = existingData ? existingData.sha : undefined;
+      await db.prepare(
+        'INSERT OR REPLACE INTO user_data (user_id, data, updated_at) VALUES (?, ?, ?)'
+      ).bind(uid, JSON.stringify(merged), now).run();
       
-      await githubWriteFile(env, dataPath, merged, `Sync data for ${user}`, dataSha);
+      // 记录同步日志
+      try {
+        await db.prepare(
+          'INSERT INTO sync_log (user_id, action, size, created_at) VALUES (?, ?, ?, ?)'
+        ).bind(uid, 'push', raw.length, now).run();
+      } catch (e) {
+        // 日志失败不影响主流程
+        console.warn('Sync log failed:', e);
+      }
       
       return json({ ok: true, data: merged });
     }
