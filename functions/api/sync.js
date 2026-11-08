@@ -1,27 +1,30 @@
 /**
- * 双端同步 · Cloudflare Pages Functions · D1 版
+ * 双端同步 · Cloudflare Pages Functions · GitHub 版
  * 路由：/functions/api/sync.js → https://你的域名/api/sync
  *
  * ── 架构 ──
  *   - 前端单页应用托管在 Pages 静态资源
  *   - 此函数运行在 Cloudflare Workers 边缘
- *   - 数据持久化到 Cloudflare D1（SQLite 边缘数据库）
+ *   - 数据持久化到 GitHub 仓库文件（sync-data/<uid>.json）
  *
- * ── 与 EdgeOne Blob 版对比 ──
- *   - 数据模型：D1 表结构 vs Blob 对象存储
- *   - API 接口：完全一致，前端零改动
- *   - 一致性：D1 强一致，无需额外配置
- *   - 可移植性：D1 SQL 标准，易于迁移
+ * ── 与 D1 版对比 ──
+ *   - 存储：GitHub 文件 vs D1 数据库
+ *   - API：完全一致，前端零改动
+ *   - 一致性：GitHub 强一致
+ *   - 优点：免费、自带版本历史、无需数据库配置
  *
  * ── 安全设计 ──
  *   - 密码加盐 SHA-256 哈希
- *   - 限流：连续失败 5 次锁定 5 分钟
+ *   - 敏感数据（盐、哈希）与用户数据分开存储
  *   - CORS 预检支持
  */
 
-const MAX_FAIL = 5;
-const LOCK_MS = 5 * 60 * 1000;
 const MAX_BYTES = 700 * 1024;  // 受限于请求体 1MB
+
+// GitHub 配置（通过环境变量注入）
+const GITHUB_TOKEN = env => env.GITHUB_TOKEN;
+const GITHUB_REPO = env => env.GITHUB_REPO || 'Dongqin-Chen/mumusan-workbench';
+const GITHUB_BRANCH = env => env.GITHUB_BRANCH || 'main';
 
 /** 统一 JSON 响应 */
 function json(obj, status = 200) {
@@ -75,42 +78,70 @@ async function getUid(user) {
   return await hex('u|' + user);
 }
 
-/** 限流检查 */
-async function checkRateLimit(env, uid) {
-  // 使用 D1 的 rate 表替代 KV
-  const row = await env.DB.prepare(
-    'SELECT n, until FROM rate_limit WHERE user_id = ?'
-  ).bind(uid).first();
+/** 从 GitHub 读取文件内容 */
+async function githubReadFile(env, path) {
+  const token = GITHUB_TOKEN(env);
+  if (!token) throw new Error('GITHUB_TOKEN 未配置');
   
-  if (!row) return { ok: true, n: 0 };
+  const url = `https://api.github.com/repos/${GITHUB_REPO(env)}/contents/${encodeURIComponent(path)}?ref=${GITHUB_BRANCH(env)}`;
+  const resp = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'mumusan-workbench'
+    }
+  });
   
-  const now = Date.now();
-  if (row.until && now < row.until) {
-    const mins = Math.ceil((row.until - now) / 60000);
-    return { ok: false, error: `密码错误次数过多，请 ${mins} 分钟后再试`, mins };
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GitHub 读取失败: ${resp.status} ${text}`);
   }
   
-  return { ok: true, n: row.n || 0 };
+  const data = await resp.json();
+  if (!data.content) return null;
+  
+  // GitHub API 返回 base64 编码的内容
+  const content = atob(data.content.replace(/\n/g, ''));
+  return JSON.parse(content);
 }
 
-/** 更新限流计数 */
-async function updateRateLimit(env, uid, n, until) {
-  await env.DB.prepare(
-    'INSERT OR REPLACE INTO rate_limit (user_id, n, until) VALUES (?, ?, ?)'
-  ).bind(uid, n, until).run();
-}
-
-/** 清零限流 */
-async function clearRateLimit(env, uid) {
-  await env.DB.prepare(
-    'DELETE FROM rate_limit WHERE user_id = ?'
-  ).bind(uid).run();
+/** 写入文件到 GitHub */
+async function githubWriteFile(env, path, content, message, sha) {
+  const token = GITHUB_TOKEN(env);
+  if (!token) throw new Error('GITHUB_TOKEN 未配置');
+  
+  const body = {
+    message,
+    content: btoa(JSON.stringify(content, null, 2)),
+    branch: GITHUB_BRANCH(env)
+  };
+  
+  if (sha) body.sha = sha;
+  
+  const url = `https://api.github.com/repos/${GITHUB_REPO(env)}/contents/${encodeURIComponent(path)}`;
+  const resp = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'mumusan-workbench'
+    },
+    body: JSON.stringify(body)
+  });
+  
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GitHub 写入失败: ${resp.status} ${text}`);
+  }
+  
+  return await resp.json();
 }
 
 /** 主处理函数 */
 export async function onRequestPost(context) {
   const { request, env } = context;
-  const db = env.DB;
   
   let body;
   try {
@@ -133,104 +164,102 @@ export async function onRequestPost(context) {
   
   const uid = await getUid(user);
   const now = Date.now();
+  const authPath = `sync-data/auth/${uid}.json`;
+  const dataPath = `sync-data/data/${uid}.json`;
   
-  // ── 限流检查 ──
-  // 注：D1 版简化限流，直接查询 users 表，复杂限流可后续扩展
-  
-  // 查询用户
-  const auth = await db.prepare(
-    'SELECT salt, hash, created_at FROM users WHERE id = ?'
-  ).bind(uid).first();
-  
-  // ── 首次使用：注册 ──
-  if (!auth) {
-    if (action !== 'register' && action !== 'push') {
+  try {
+    // ── 首次使用：注册 ──
+    if (action === 'register' || action === 'push') {
+      const existingAuth = await githubReadFile(env, authPath);
+      
+      if (!existingAuth) {
+        // 新用户注册
+        const salt = randSalt();
+        const hash = await hex(pass + '|' + salt);
+        const data = body.data || {};
+        
+        const authResult = await githubWriteFile(env, authPath, {
+          salt,
+          hash,
+          created_at: now,
+          changed_at: null
+        }, `Register user ${user}`);
+        
+        await githubWriteFile(env, dataPath, data, `Init data for ${user}`);
+        
+        return json({ ok: true, created: true, data });
+      }
+    }
+    
+    // ── 读取认证信息 ──
+    const auth = await githubReadFile(env, authPath);
+    if (!auth) {
       return json({ error: 'NO_ACCOUNT' }, 404);
     }
     
-    const salt = randSalt();
-    const hash = await hex(pass + '|' + salt);
-    
-    await db.prepare(
-      'INSERT INTO users (id, salt, hash, created_at) VALUES (?, ?, ?, ?)'
-    ).bind(uid, salt, hash, now).run();
-    
-    const data = body.data || {};
-    await db.prepare(
-      'INSERT INTO user_data (user_id, data, updated_at) VALUES (?, ?, ?)'
-    ).bind(uid, JSON.stringify(data), now).run();
-    
-    return json({ ok: true, created: true, data });
-  }
-  
-  // ── 验密码 ──
-  const h = await hex(pass + '|' + auth.salt);
-  if (h !== auth.hash) {
-    // 简化限流，实际生产环境可接入 KV
-    return json({ error: '密码错误' }, 401);
-  }
-  
-  // ── 改密码 ──
-  if (action === 'chpass') {
-    const np = String(body.newPass || '');
-    if (np.length < 8) {
-      return json({ error: '新密码至少 8 位' }, 400);
+    // ── 验密码 ──
+    const h = await hex(pass + '|' + auth.salt);
+    if (h !== auth.hash) {
+      return json({ error: '密码错误' }, 401);
     }
     
-    const salt = randSalt();
-    const hash = await hex(np + '|' + salt);
-    
-    await db.prepare(
-      'UPDATE users SET salt = ?, hash = ?, changed_at = ? WHERE id = ?'
-    ).bind(salt, hash, now, uid).run();
-    
-    return json({ ok: true, changed: true });
-  }
-  
-  // ── 拉取 ──
-  if (action === 'pull') {
-    const row = await db.prepare(
-      'SELECT data FROM user_data WHERE user_id = ?'
-    ).bind(uid).first();
-    
-    const data = row ? JSON.parse(row.data) : {};
-    return json({ ok: true, data });
-  }
-  
-  // ── 推送 ──
-  if (action === 'push') {
-    const raw = JSON.stringify(body.data || {});
-    if (raw.length > MAX_BYTES) {
-      return json({ error: '数据太大了（超过 700KB）。图片类内容不要参与同步' }, 413);
+    // ── 改密码 ──
+    if (action === 'chpass') {
+      const np = String(body.newPass || '');
+      if (np.length < 8) {
+        return json({ error: '新密码至少 8 位' }, 400);
+      }
+      
+      const salt = randSalt();
+      const hash = await hex(np + '|' + salt);
+      
+      // 读取现有文件 SHA（GitHub API 返回的 sha 字段）
+      const existingAuth = await githubReadFile(env, authPath);
+      const authSha = existingAuth ? await githubReadFile(env, authPath).then(f => f && f.sha) : undefined;
+      
+      await githubWriteFile(env, authPath, {
+        salt,
+        hash,
+        created_at: auth.created_at,
+        changed_at: now
+      }, `Change password for ${user}`, authSha);
+      
+      return json({ ok: true, changed: true });
     }
     
-    // 获取服务端数据
-    const serverRow = await db.prepare(
-      'SELECT data FROM user_data WHERE user_id = ?'
-    ).bind(uid).first();
-    
-    const server = serverRow ? JSON.parse(serverRow.data) : {};
-    const client = body.data || {};
-    const merged = mergeAll(server, client);
-    
-    await db.prepare(
-      'INSERT OR REPLACE INTO user_data (user_id, data, updated_at) VALUES (?, ?, ?)'
-    ).bind(uid, JSON.stringify(merged), now).run();
-    
-    // 记录同步日志
-    try {
-      await db.prepare(
-        'INSERT INTO sync_log (user_id, action, size, created_at) VALUES (?, ?, ?, ?)'
-      ).bind(uid, 'push', raw.length, now).run();
-    } catch (e) {
-      // 日志失败不影响主流程
-      console.warn('Sync log failed:', e);
+    // ── 拉取 ──
+    if (action === 'pull') {
+      const data = await githubReadFile(env, dataPath) || {};
+      return json({ ok: true, data });
     }
     
-    return json({ ok: true, data: merged });
+    // ── 推送 ──
+    if (action === 'push') {
+      const raw = JSON.stringify(body.data || {});
+      if (raw.length > MAX_BYTES) {
+        return json({ error: '数据太大了（超过 700KB）。图片类内容不要参与同步' }, 413);
+      }
+      
+      // 获取服务端数据
+      const server = await githubReadFile(env, dataPath) || {};
+      const client = body.data || {};
+      const merged = mergeAll(server, client);
+      
+      // 读取现有文件 SHA
+      const existingData = await githubReadFile(env, dataPath);
+      const dataSha = existingData ? existingData.sha : undefined;
+      
+      await githubWriteFile(env, dataPath, merged, `Sync data for ${user}`, dataSha);
+      
+      return json({ ok: true, data: merged });
+    }
+    
+    return json({ error: '未知操作' }, 400);
+    
+  } catch (e) {
+    console.error('Sync error:', e);
+    return json({ error: e.message || '服务器错误' }, 500);
   }
-  
-  return json({ error: '未知操作' }, 400);
 }
 
 /** CORS 预检 */
